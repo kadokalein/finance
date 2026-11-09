@@ -31,18 +31,73 @@
     card:     { label: 'Credit card owed',icon: '💳', debt: true },
   };
   const KEY = 'moneytracker.v1';
+  const SUPABASE_URL = 'https://ryrbydoazzahmwzdvfxv.supabase.co';
+  const SUPABASE_KEY = 'sb_publishable_7W6YEkn06YbfiILq7K8FDQ_JZMNlfJ7'; // public "publishable" key; row-level security protects the data
+  const sb = window.supabase ? window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY) : null;
 
   /* ---------- state ---------- */
   const blank = () => ({ onboarded: false, income: 0, bills: [], assets: [], tx: [] });
-  let S = load();
-  let view = S.onboarded ? 'home' : 'income';
+  let S = blank();
+  let view = 'loading';
   let editing = false; // setup screens reached from the menu
+  let user = null, recovering = false;
+  let syncState = 'idle', lastSeen = null, saveTimer = null, dirty = false;
+  let authMode = 'signin', authMsg = '', authBusy = false, authEmail = '';
 
-  function load() {
-    try { return Object.assign(blank(), JSON.parse(localStorage.getItem(KEY) || '{}')); }
-    catch (e) { return blank(); }
+  const cacheKey = () => `${KEY}.${user ? user.id : 'anon'}`;
+  function readLocal(key) {
+    try { const raw = localStorage.getItem(key); return raw ? Object.assign(blank(), JSON.parse(raw)) : null; }
+    catch (e) { return null; }
   }
-  function save() { try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) { /* storage unavailable */ } }
+  const hasData = (d) => d && (d.onboarded || d.income || d.bills.length || d.assets.length || d.tx.length);
+
+  /* Every change is cached locally, then saved to the signed-in account a moment later. */
+  function save() {
+    try { localStorage.setItem(cacheKey(), JSON.stringify(S)); } catch (e) { /* storage unavailable */ }
+    if (!sb || !user) return;
+    dirty = true; setSync('saving');
+    clearTimeout(saveTimer); saveTimer = setTimeout(flush, 500);
+  }
+  async function flush() {
+    if (!sb || !user || !dirty) return;
+    const stamp = new Date().toISOString();
+    dirty = false;
+    const { error } = await sb.from('finance_data').upsert({ user_id: user.id, data: S, updated_at: stamp });
+    if (error) { dirty = true; setSync('offline'); return; }
+    lastSeen = stamp;
+    if (!dirty) setSync('saved');
+  }
+  const SYNC_LABEL = { idle: '', saving: '⏳ Saving…', saved: '✅ Synced', offline: '⚠️ Offline – will retry' };
+  function setSync(st) { syncState = st; const el = $('#syncTag'); if (el) el.textContent = SYNC_LABEL[st]; }
+
+  async function loadCloud() {
+    const { data, error } = await sb.from('finance_data').select('data,updated_at').eq('user_id', user.id).maybeSingle();
+    if (error) { // offline: fall back to this device's cached copy
+      S = readLocal(cacheKey()) || blank(); setSync('offline'); dirty = hasData(S);
+    } else if (data) {
+      S = Object.assign(blank(), data.data); lastSeen = data.updated_at; setSync('saved');
+    } else { // brand-new account: adopt data already on this device (from before accounts existed)
+      const local = readLocal(cacheKey()) || readLocal(KEY);
+      S = local || blank();
+      if (hasData(S)) { dirty = true; await flush(); }
+    }
+    try { localStorage.setItem(cacheKey(), JSON.stringify(S)); } catch (e) { /* ignore */ }
+    editing = false;
+    view = recovering ? 'newpass' : (S.onboarded ? 'home' : 'income');
+  }
+
+  /* Pick up changes made on another device. */
+  async function pull() {
+    if (!sb || !user) return;
+    if (dirty) return flush();
+    if (view !== 'home' || !$('#sheet').classList.contains('hidden') || $('#drawer').classList.contains('open')) return;
+    const { data, error } = await sb.from('finance_data').select('data,updated_at').eq('user_id', user.id).maybeSingle();
+    if (error || !data || !lastSeen || Date.parse(data.updated_at) === Date.parse(lastSeen)) return;
+    S = Object.assign(blank(), data.data); lastSeen = data.updated_at;
+    try { localStorage.setItem(cacheKey(), JSON.stringify(S)); } catch (e) { /* ignore */ }
+    setSync('saved'); render();
+  }
+
   const uid = () => Math.random().toString(36).slice(2, 10);
 
   /* ---------- helpers ---------- */
@@ -203,8 +258,80 @@
   function render() {
     closeDrawer();
     window.scrollTo(0, 0);
+    if (view === 'loading') return (app.innerHTML = '<div class="setup"><div class="lead"><h2>Loading…</h2></div></div>');
+    if (view === 'auth') return renderAuth();
+    if (view === 'newpass') return renderNewPass();
     if (view === 'home') return renderHome();
     return renderSetup();
+  }
+
+  /* ----- sign in / create account ----- */
+  function renderAuth() {
+    const up = authMode === 'signup';
+    app.innerHTML = `
+      <header class="topbar"><h1>Money Tracker</h1></header>
+      <div class="setup">
+        <div class="lead"><h2>${up ? 'Create your account' : 'Welcome back'}</h2>
+          <p>${up ? 'Your information is saved to your account and syncs on every device.' : 'Sign in to see your finances on any device.'}</p></div>
+        <form class="card form" id="authForm" novalidate>
+          <div><label for="em">Email</label><input id="em" type="email" autocomplete="email" inputmode="email" placeholder="you@example.com" value="${esc(authEmail)}"></div>
+          <div><label for="pw">Password</label><input id="pw" type="password" autocomplete="${up ? 'new-password' : 'current-password'}" placeholder="${up ? 'At least 6 characters' : 'Your password'}"></div>
+          ${authMsg ? `<div class="note" role="alert">${esc(authMsg)}</div>` : ''}
+          <button class="btn" type="submit" ${authBusy ? 'disabled' : ''}>${authBusy ? 'Please wait…' : up ? 'Create account' : 'Sign in'}</button>
+        </form>
+        <button class="link" id="swap">${up ? 'I already have an account — sign in' : 'New here? Create an account'}</button>
+        ${up ? '' : '<button class="link" id="forgot">Forgot password?</button>'}
+      </div>`;
+    const em = $('#em'), pw = $('#pw');
+    em.addEventListener('input', () => { authEmail = em.value; });
+    $('#swap').onclick = () => { authMode = up ? 'signin' : 'signup'; authMsg = ''; renderAuth(); };
+    const forgot = $('#forgot');
+    if (forgot) forgot.onclick = async () => {
+      if (!em.value.trim()) { authMsg = 'Type your email above first, then tap “Forgot password?”.'; return renderAuth(); }
+      const { error } = await sb.auth.resetPasswordForEmail(em.value.trim(), { redirectTo: location.origin + location.pathname });
+      authMsg = error ? error.message : 'Check your email for a link to reset your password.'; renderAuth();
+    };
+    $('#authForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const email = em.value.trim(), password = pw.value;
+      if (!email || !password) { authMsg = 'Enter your email and password.'; return renderAuth(); }
+      if (!sb) { authMsg = 'Could not load the sign-in service. Check your connection and reload.'; return renderAuth(); }
+      authBusy = true; authMsg = ''; renderAuth();
+      const res = up
+        ? await sb.auth.signUp({ email, password, options: { emailRedirectTo: location.origin + location.pathname } })
+        : await sb.auth.signInWithPassword({ email, password });
+      authBusy = false;
+      if (res.error) { authMsg = res.error.message; return renderAuth(); }
+      if (res.data.session) return onSession(res.data.session);
+      authMode = 'signin'; authMsg = 'Account created. Check your email and tap the confirmation link, then sign in.'; renderAuth();
+    });
+    (em.value ? pw : em).focus();
+  }
+
+  function renderNewPass() {
+    app.innerHTML = `<header class="topbar"><h1>New password</h1></header>
+      <div class="setup"><form class="card form" id="npForm" novalidate>
+        <div><label for="np">Choose a new password</label><input id="np" type="password" autocomplete="new-password" placeholder="At least 6 characters"></div>
+        ${authMsg ? `<div class="note" role="alert">${esc(authMsg)}</div>` : ''}
+        <button class="btn" type="submit">Save password</button></form></div>`;
+    $('#npForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const { error } = await sb.auth.updateUser({ password: $('#np').value });
+      if (error) { authMsg = error.message; return renderNewPass(); }
+      recovering = false; authMsg = ''; view = S.onboarded ? 'home' : 'income'; render(); toast('Password updated');
+    });
+  }
+
+  async function onSession(session) {
+    user = session.user; authMsg = '';
+    await loadCloud(); render();
+  }
+
+  async function signOut() {
+    try { localStorage.removeItem(cacheKey()); } catch (e) { /* ignore */ }
+    clearTimeout(saveTimer); dirty = false;
+    await sb.auth.signOut();
+    user = null; S = blank(); lastSeen = null; authMode = 'signin'; authMsg = ''; view = 'auth'; render();
   }
 
   /* ----- setup flow ----- */
@@ -234,7 +361,7 @@
         <div class="money"><span>$</span><input id="inc" inputmode="decimal" placeholder="0.00" value="${S.income || ''}" autocomplete="off"></div></div>
       <button class="btn" id="next">${editing ? 'Save' : 'Next'}</button>
       ${editing ? '' : '<button class="link" id="demo">or try it with sample data</button>'}
-      <p class="muted sm" style="text-align:center;margin:0">version 3</p>`;
+      <p class="muted sm" style="text-align:center;margin:0">version 4</p>`;
   }
 
   function billsStep() {
@@ -392,7 +519,7 @@
       <button class="fab" id="fab" aria-label="Add transaction">+</button>`;
 
     $('#burger').onclick = openDrawer;
-    $('#refresh').onclick = () => { render(); toast('Updated'); };
+    $('#refresh').onclick = async () => { await pull(); render(); toast('Updated'); };
     $('#fab').onclick = openTxForm;
     app.querySelectorAll('[data-open]').forEach((el) => (el.onclick = () => openDetail(el.dataset.open)));
   }
@@ -414,14 +541,15 @@
   /* ----- drawer ----- */
   function openDrawer() {
     $('#drawer').innerHTML = `
-      <div class="head"><b>Money Tracker</b><span>Net worth ${fmt0(netWorth())}</span></div>
+      <div class="head"><b>Money Tracker</b><span>${esc(user ? user.email : '')}</span><br><span id="syncTag">${SYNC_LABEL[syncState]}</span></div>
       <button class="item" data-go="home">🏠 Home</button><hr>
       <button class="item" data-go="income">💵 Monthly income</button>
       <button class="item" data-go="bills">🧾 Add / edit monthly bills</button>
       <button class="item" data-go="assets">🏡 Add property &amp; assets</button>
       <button class="item" data-go="tx">➕ Log a transaction</button>
       <button class="item" data-go="alltx">📜 All transactions</button><hr>
-      <button class="item" data-go="reset">🗑️ Reset all data</button>`;
+      <button class="item" data-go="reset">🗑️ Reset all data</button>
+      <button class="item" data-go="signout">🚪 Sign out</button>`;
     $('#drawer').classList.add('open'); $('#scrim').classList.remove('hidden');
     $('#drawer').setAttribute('aria-hidden', 'false');
     $('#drawer').querySelectorAll('[data-go]').forEach((b) => (b.onclick = () => {
@@ -430,6 +558,7 @@
       if (g === 'tx') return openTxForm();
       if (g === 'alltx') return openDetail('tx');
       if (g === 'reset') return confirmReset();
+      if (g === 'signout') return signOut();
       editing = true; view = g; render();
     }));
   }
@@ -595,5 +724,16 @@
   }
 
   /* ---------- start ---------- */
-  render();
+  async function boot() {
+    render();
+    if (!sb) { view = 'auth'; authMsg = 'Could not load the sign-in service. Check your connection and reload.'; return render(); }
+    sb.auth.onAuthStateChange((ev) => {
+      if (ev === 'PASSWORD_RECOVERY') { recovering = true; setTimeout(() => { if (user) { view = 'newpass'; render(); } }, 0); }
+    });
+    const { data } = await sb.auth.getSession();
+    if (data.session) await onSession(data.session); else { view = 'auth'; render(); }
+    setInterval(pull, 30000);
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) pull(); });
+  }
+  boot();
 })();
