@@ -233,7 +233,8 @@
       <div class="card"><label for="inc">Monthly income</label>
         <div class="money"><span>$</span><input id="inc" inputmode="decimal" placeholder="0.00" value="${S.income || ''}" autocomplete="off"></div></div>
       <button class="btn" id="next">${editing ? 'Save' : 'Next'}</button>
-      ${editing ? '' : '<button class="link" id="demo">or try it with sample data</button>'}`;
+      ${editing ? '' : '<button class="link" id="demo">or try it with sample data</button>'}
+      <p class="muted sm" style="text-align:center;margin:0">version 3</p>`;
   }
 
   function billsStep() {
