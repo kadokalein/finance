@@ -61,6 +61,9 @@
   const catOpts = (sel) => Object.entries(CATS).map(([k, c]) => `<option value="${k}"${k === sel ? ' selected' : ''}>${c.icon} ${c.label}</option>`).join('');
   const mini = (n) => (Math.abs(n) >= 1000 ? (n / 1000).toFixed(Math.abs(n) >= 10000 ? 0 : 1).replace(/\.0$/, '') + 'k' : Math.round(n));
 
+  // Run fn when Enter is pressed. (Never return false from a key handler: that blocks typing.)
+  function onEnter(el, fn) { el.addEventListener('keydown', (e) => { if (e.key === 'Enter') fn(); }); }
+
   function toast(msg) {
     const t = document.createElement('div'); t.className = 'toast'; t.textContent = msg;
     document.body.appendChild(t); setTimeout(() => t.remove(), 1800);
@@ -296,7 +299,7 @@
         editing ? finishEdit() : go('bills');
       };
       $('#next').onclick = next;
-      inc.onkeydown = (e) => e.key === 'Enter' && next();
+      onEnter(inc, next);
       const demo = $('#demo'); if (demo) demo.onclick = () => { loadDemo(); finishSetup(); };
     }
 
@@ -309,7 +312,7 @@
         const cat = $('#bc').value; render(); $('#bc').value = cat; $('#bn').focus();
       };
       $('#addBill').onclick = add;
-      ['#bn', '#ba'].forEach((s) => ($(s).onkeydown = (e) => e.key === 'Enter' && add()));
+      ['#bn', '#ba'].forEach((s) => onEnter($(s), add));
       app.querySelectorAll('[data-del-bill]').forEach((b) => (b.onclick = () => { S.bills = S.bills.filter((x) => x.id !== b.dataset.delBill); save(); render(); }));
       $('#next').onclick = () => (editing ? finishEdit() : go('assets'));
     }
@@ -322,7 +325,7 @@
         S.assets.push({ id: uid(), name, type: $('#at').value, value }); save(); render(); $('#an').focus();
       };
       $('#addAsset').onclick = add;
-      ['#an', '#av'].forEach((s) => ($(s).onkeydown = (e) => e.key === 'Enter' && add()));
+      ['#an', '#av'].forEach((s) => onEnter($(s), add));
       app.querySelectorAll('[data-del-asset]').forEach((b) => (b.onclick = () => { S.assets = S.assets.filter((x) => x.id !== b.dataset.delAsset); save(); render(); }));
       $('#next').onclick = () => (editing ? finishEdit() : finishSetup());
     }
@@ -544,7 +547,7 @@
         closeSheet(); toast('Saved');
       };
       $('#saveTx', sh).onclick = saveTx;
-      $('#ta', sh).onkeydown = (e) => e.key === 'Enter' && saveTx();
+      onEnter($('#ta', sh), saveTx);
       $('#tn', sh).focus();
     });
   }
