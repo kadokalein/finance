@@ -36,7 +36,24 @@
   const sb = window.supabase ? window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY) : null;
 
   /* ---------- state ---------- */
-  const blank = () => ({ onboarded: false, income: 0, bills: [], assets: [], tx: [] });
+  const LEVERS = {
+    sac: [['eat', 'Eating out less', 150], ['out', 'Going out less', 50], ['subs', 'Cancel unused subscriptions', 30], ['coffee', 'Coffee at home', 60],
+      ['cook', 'Cook / meal prep more', 100], ['impulse', 'Fewer impulse buys', 75], ['plan', 'Cheaper phone / internet plan', 25]],
+    ext: [['gig', 'Side gig', 400], ['ot', 'Overtime / extra shifts', 200], ['sell', 'Sell unused items', 100], ['free', 'Freelance work', 300], ['rent', 'Rent out a room / parking', 500]],
+  };
+  const todayStr = () => { const n = new Date(); return `${n.getFullYear()}-${String(n.getMonth() + 1).padStart(2, '0')}-${String(n.getDate()).padStart(2, '0')}`; };
+  const blank = () => ({
+    onboarded: false, income: 0, bills: [], assets: [], tx: [],
+    pay: { freq: 'monthly', day1: 1, day2: 15, anchor: null },   // when income arrives
+    startBalance: 0, balanceDate: todayStr(), balanceSetAt: 0,     // cash on hand, and when it was entered
+    budget: 0,                                                     // planned everyday (non-bill) spending per month
+    lowLimit: 0,                                                   // warn when the projected balance drops below this
+    goal: null,                                                    // { amount, date|null, created, base }
+    levers: {
+      sac: LEVERS.sac.map(([id, name, amount]) => ({ id, name, amount, on: false })),
+      ext: LEVERS.ext.map(([id, name, amount]) => ({ id, name, amount, on: false })),
+    },
+  });
   let S = blank();
   let view = 'loading';
   let editing = false; // setup screens reached from the menu
@@ -76,6 +93,7 @@
       S = readLocal(cacheKey()) || blank(); setSync('offline'); dirty = hasData(S);
     } else if (data) {
       S = Object.assign(blank(), data.data); lastSeen = data.updated_at; setSync('saved');
+      if (!data.data.balanceDate) save(); // older data: pin the starting-balance date so it doesn't drift
     } else { // brand-new account: adopt data already on this device (from before accounts existed)
       const local = readLocal(cacheKey()) || readLocal(KEY);
       S = local || blank();
@@ -182,7 +200,7 @@
     const bills = billsTotal();
     const spent = varSpent(key);
     const baseline = prior.length ? sum(Object.values(typical), (x) => x) : null;
-    const remaining = baseline !== null ? Math.max(0, baseline * (1 - frac)) : (spent / frac) * (1 - frac);
+    const remaining = S.budget > 0 ? S.budget * (1 - frac) : baseline !== null ? Math.max(0, baseline * (1 - frac)) : (spent / frac) * (1 - frac);
     const projectedVar = spent + remaining;
     const planned = S.income - bills;
     return {
@@ -190,22 +208,99 @@
       leftNow: planned - spent,
       projectedVar,
       endBalance: planned - projectedVar,
-      usedHistory: prior.length > 0,
+      usedHistory: prior.length > 0, usedBudget: S.budget > 0,
       daysLeft: dim - now.getDate(),
       perDay: Math.max(0, (planned - spent) / Math.max(1, dim - now.getDate())),
     };
   }
 
-  /* ---------- charts (inline SVG) ---------- */
-  function donut(income, expenses) {
-    const total = Math.max(income, expenses, 1);
-    const r = 24, c = 2 * Math.PI * r;
-    const e = Math.min(expenses / total, 1) * c;
-    return `<svg viewBox="0 0 64 64"><g transform="rotate(-90 32 32)" fill="none" stroke-width="14">
-      <circle cx="32" cy="32" r="${r}" stroke="#4caf50"/>
-      <circle cx="32" cy="32" r="${r}" stroke="#f44336" stroke-dasharray="${e} ${c}"/></g></svg>`;
+  /* ---------- paydays, due dates & the day-by-day balance ---------- */
+  const today0 = () => { const n = new Date(); return new Date(n.getFullYear(), n.getMonth(), n.getDate()); };
+  const addDays = (d, n) => new Date(d.getFullYear(), d.getMonth(), d.getDate() + n);
+  const dnum = (d) => Math.round(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()) / 864e5);
+  const dimOf = (d) => new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate();
+  const clampDay = (day, d) => Math.min(day, dimOf(d)); // a bill due on the 31st falls on the last day of shorter months
+  const ord = (n) => n + (n % 100 >= 11 && n % 100 <= 13 ? 'th' : ['th', 'st', 'nd', 'rd'][n % 10] || 'th');
+  const fmtDate = (d) => d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+  const short$ = (v) => (v < 0 ? '-' : '') + '$' + mini(Math.abs(v));
+
+  /* Income landing on a given day, from the pay schedule. */
+  function incomeOn(d) {
+    const p = S.pay || {}, inc = S.income || 0, day = d.getDate();
+    if (!inc) return 0;
+    if (p.freq === 'weekly' || p.freq === 'biweekly') {
+      if (!p.anchor) return 0;
+      const step = p.freq === 'weekly' ? 7 : 14, diff = dnum(d) - dnum(parseD(p.anchor));
+      return ((diff % step) + step) % step === 0 ? (inc * 12) / (p.freq === 'weekly' ? 52 : 26) : 0;
+    }
+    if (p.freq === 'semi') return day === clampDay(p.day1 || 1, d) || day === clampDay(p.day2 || 15, d) ? inc / 2 : 0;
+    return day === clampDay(p.day1 || 1, d) ? inc : 0;
+  }
+  const billsOn = (d) => S.bills.filter((b) => clampDay(b.dueDay || 1, d) === d.getDate());
+  const leverMonthly = () => sum(S.levers.sac.filter((x) => x.on), (x) => x.amount) + sum(S.levers.ext.filter((x) => x.on), (x) => x.amount);
+
+  /* End-of-day balance for every day from the starting-balance date to `end`.
+     Past days use ONLY what really happened (paydays, bills on their due dates, spending you logged).
+     Future days also subtract the planned everyday budget, spread evenly; with `withLevers`, the selected
+     sacrifices and extra income are added on top. */
+  function balances(end, withLevers) {
+    const out = {};
+    if (!S.balanceDate) return out;
+    const byDay = {};
+    S.tx.forEach((t) => { (byDay[t.date] = byDay[t.date] || []).push(t); });
+    const t0 = today0(), lev = withLevers ? leverMonthly() : 0;
+    let bal = S.startBalance || 0;
+    for (let d = parseD(S.balanceDate); d <= end; d = addDays(d, 1)) {
+      const k = ymd(d), first = k === S.balanceDate;
+      if (!first) bal += incomeOn(d) - sum(billsOn(d), (b) => b.amount);
+      // on the day the balance was entered, only count spending logged after it was entered
+      bal -= sum((byDay[k] || []).filter((t) => !first || (t.created || 0) > (S.balanceSetAt || 0)), (t) => t.amount);
+      if (d > t0) bal += (lev - (S.budget || 0)) / dimOf(d);
+      out[k] = bal;
+    }
+    return out;
+  }
+  function currentBalance() {
+    const t = today0(), b = balances(t, false)[ymd(t)];
+    return b === undefined ? S.startBalance || 0 : b;
   }
 
+  /* This month so far: what was really spent vs. what the plan said by today. */
+  function planVsActual() {
+    const t0 = today0(), key = mkey(t0), day = t0.getDate(), dim = dimOf(t0), tk = ymd(t0);
+    const billsDue = sum(S.bills.filter((b) => clampDay(b.dueDay || 1, t0) <= day), (b) => b.amount);
+    const logged = sum(S.tx.filter((t) => t.date.slice(0, 7) === key && t.date <= tk), (t) => t.amount);
+    const budgetByNow = ((S.budget || 0) * day) / dim;
+    return { day, dim, billsDue, logged, budgetByNow, actual: billsDue + logged, planned: billsDue + budgetByNow, diff: logged - budgetByNow };
+  }
+
+  /* When is the savings goal met? Walks the daily balance forward (up to 10 years). */
+  function goalStatus() {
+    const g = S.goal;
+    if (!g || !(g.amount > 0)) return null;
+    const t0 = today0(), end = addDays(t0, 3660), lev = leverMonthly();
+    const plainSeries = balances(end, false), boostSeries = lev ? balances(end, true) : plainSeries;
+    const reach = (series) => {
+      for (let d = t0; d <= end; d = addDays(d, 1)) if (series[ymd(d)] - g.base >= g.amount - 0.005) return d;
+      return null;
+    };
+    const now = plainSeries[ymd(t0)];
+    const saved = (now === undefined ? S.startBalance || 0 : now) - g.base;
+    const out = {
+      g, lev, saved, pct: Math.max(0, Math.min(1, saved / g.amount)),
+      plain: reach(plainSeries), boosted: reach(boostSeries), gain: 0,
+      monthlyNet: S.income - billsTotal() - (S.budget || 0),
+    };
+    if (out.boosted) out.gain = boostSeries[ymd(out.boosted)] - plainSeries[ymd(out.boosted)];
+    if (g.date && boostSeries[g.date] !== undefined) {
+      out.onDate = boostSeries[g.date] - g.base;
+      out.short = g.amount - out.onDate;
+      out.needPerMonth = out.short > 0 ? out.short / Math.max(1, (dnum(parseD(g.date)) - dnum(t0)) / 30.44) : 0;
+    }
+    return out;
+  }
+
+  /* ---------- charts (inline SVG) ---------- */
   function barChart7() {
     const days = [];
     for (let i = 6; i >= 0; i--) { const d = new Date(); d.setDate(d.getDate() - i); days.push(d); }
@@ -355,13 +450,32 @@
   }
 
   function incomeStep() {
+    const p = S.pay || {}, f = p.freq || 'monthly';
+    const dayOpts = (sel) => Array.from({ length: 31 }, (_, i) => `<option value="${i + 1}"${i + 1 === sel ? ' selected' : ''}>${ord(i + 1)}</option>`).join('');
+    const freqs = [['monthly', 'Once a month'], ['semi', 'Twice a month'], ['biweekly', 'Every two weeks'], ['weekly', 'Every week']];
     return `
-      <div class="lead"><h2>Let’s set up your money</h2><p>First, what’s your household’s total monthly income (after tax)?</p></div>
-      <div class="card"><label for="inc">Monthly income</label>
-        <div class="money"><span>$</span><input id="inc" inputmode="decimal" placeholder="0.00" value="${S.income || ''}" autocomplete="off"></div></div>
+      <div class="lead"><h2>${editing ? 'Income, payday &amp; balance' : 'Let’s set up your money'}</h2>
+        <p>${editing ? 'These numbers drive the calendar and your goal date.' : 'First, your household income and when it arrives.'}</p></div>
+      <div class="card form">
+        <div><label for="inc">Monthly income (after tax)</label>
+          <div class="money"><span>$</span><input id="inc" inputmode="decimal" placeholder="0.00" value="${S.income || ''}" autocomplete="off"></div></div>
+        <div><label for="pf">How often are you paid?</label>
+          <select id="pf">${freqs.map(([k, l]) => `<option value="${k}"${k === f ? ' selected' : ''}>${l}</option>`).join('')}</select></div>
+        <div id="pgDay1"><label for="pd1" id="pd1l">Payday (day of the month)</label><select id="pd1">${dayOpts(p.day1 || 1)}</select></div>
+        <div id="pgDay2"><label for="pd2">Second payday</label><select id="pd2">${dayOpts(p.day2 || 15)}</select></div>
+        <div id="pgAnchor"><label for="pa">Date of any one of your paydays</label><input id="pa" type="date" value="${p.anchor || ''}"></div>
+      </div>
+      <div class="card form">
+        <div><label for="cash">Money you have right now (bank + cash)</label>
+          <div class="money"><span>$</span><input id="cash" inputmode="decimal" placeholder="0.00" value="${S.balanceSetAt ? currentBalance().toFixed(2) : ''}" autocomplete="off"></div>
+          <div class="muted sm hint">${S.balanceSetAt ? 'This is today’s balance by the app’s math. Change it if your bank says something different.' : 'The calendar counts forward from this number.'}</div></div>
+        <div><label for="bud">Everyday spending budget per month (optional)</label>
+          <div class="money"><span>$</span><input id="bud" inputmode="decimal" placeholder="0.00" value="${S.budget || ''}" autocomplete="off"></div>
+          <div class="muted sm hint">What you plan to spend on things that aren’t bills. It is only ever used for “planned” numbers — never counted as actual spending.</div></div>
+      </div>
       <button class="btn" id="next">${editing ? 'Save' : 'Next'}</button>
       ${editing ? '' : '<button class="link" id="demo">or try it with sample data</button>'}
-      <p class="muted sm" style="text-align:center;margin:0">version 4</p>`;
+      <p class="muted sm" style="text-align:center;margin:0">version 5</p>`;
   }
 
   function billsStep() {
@@ -370,6 +484,8 @@
       <div class="card formcard">
         <h2>New bill</h2><button class="plus" id="addBill" aria-label="Add bill">+</button>
         <div class="form">
+          <div><label for="bd">When is expense/bill due?</label><input id="bd" type="date">
+            <div class="muted sm hint">Pick its next due date — it repeats on that day every month.</div></div>
           <div><label for="bn">Name</label><input id="bn" placeholder="e.g. Apartment rent" autocomplete="off"></div>
           <div><label for="bc">Category</label><select id="bc">${catOpts('rent')}</select></div>
           <div><label for="ba">Monthly cost</label><div class="money"><span>$</span><input id="ba" inputmode="decimal" placeholder="0.00" autocomplete="off"></div></div>
@@ -378,7 +494,8 @@
       <div class="card"><h2>Your bills</h2>${
         S.bills.length
           ? S.bills.map((b) => `<div class="row"><div class="badge" style="background:${CATS[b.category].color}22">${CATS[b.category].icon}</div>
-              <div class="grow"><div class="t">${esc(b.name)}</div><div class="s">${CATS[b.category].label}</div></div>
+              <div class="grow"><div class="t">${esc(b.name)}</div><div class="s">${CATS[b.category].label} · due
+                <select class="inline-due" data-due="${b.id}" aria-label="Due day for ${esc(b.name)}"><option value="">not set</option>${Array.from({ length: 31 }, (_, i) => `<option value="${i + 1}"${b.dueDay === i + 1 ? ' selected' : ''}>${ord(i + 1)}</option>`).join('')}</select></div></div>
               <div class="amt">${fmt(b.amount)}</div><button class="del" data-del-bill="${b.id}" aria-label="Remove">✕</button></div>`).join('') +
             `<div class="total"><span>Total / month</span><span class="neg">${fmt(billsTotal())}</span></div>`
           : '<div class="empty">No bills yet</div>'}</div>
@@ -419,15 +536,36 @@
     if (back) back.onclick = () => (editing ? finishEdit() : go(STEPS[STEPS.indexOf(view) - 1]));
 
     if (view === 'income') {
-      const inc = $('#inc');
+      const inc = $('#inc'), pf = $('#pf');
+      const showPay = () => {
+        const f = pf.value, byDate = f === 'weekly' || f === 'biweekly';
+        $('#pgDay1').classList.toggle('hidden', byDate);
+        $('#pgDay2').classList.toggle('hidden', f !== 'semi');
+        $('#pgAnchor').classList.toggle('hidden', !byDate);
+        $('#pd1l').textContent = f === 'semi' ? 'First payday' : 'Payday (day of the month)';
+      };
+      pf.onchange = showPay; showPay();
       const next = () => {
-        const v = num(inc.value);
+        const v = num(inc.value), f = pf.value, cashRaw = $('#cash').value.trim(), bud = num($('#bud').value);
         if (!(v > 0)) { inc.focus(); return toast('Enter your monthly income'); }
-        S.income = v; save();
+        if ((f === 'weekly' || f === 'biweekly') && !$('#pa').value) { $('#pa').focus(); return toast('Pick the date of one of your paydays'); }
+        if (cashRaw !== '' && isNaN(num(cashRaw))) { $('#cash').focus(); return toast('Enter the money you have as a number'); }
+        const before = currentBalance();
+        S.income = v;
+        S.pay = { freq: f, day1: +$('#pd1').value, day2: +$('#pd2').value, anchor: $('#pa').value || null };
+        S.budget = bud > 0 ? bud : 0;
+        if (cashRaw !== '') {
+          const c = num(cashRaw);
+          if (!S.balanceSetAt || Math.abs(c - before) > 0.005) {
+            if (S.goal) S.goal.base += c - before; // correcting the balance is not "saving"
+            S.startBalance = c; S.balanceDate = todayStr(); S.balanceSetAt = Date.now();
+          }
+        }
+        save();
         editing ? finishEdit() : go('bills');
       };
       $('#next').onclick = next;
-      onEnter(inc, next);
+      ['#inc', '#cash', '#bud'].forEach((q) => onEnter($(q), next));
       const demo = $('#demo'); if (demo) demo.onclick = () => { loadDemo(); finishSetup(); };
     }
 
@@ -436,10 +574,14 @@
         const name = $('#bn').value.trim(), amount = num($('#ba').value);
         if (!name) { $('#bn').focus(); return toast('Give the bill a name'); }
         if (!(amount > 0)) { $('#ba').focus(); return toast('Enter the monthly cost'); }
-        S.bills.push({ id: uid(), name, category: $('#bc').value, amount }); save();
+        const due = $('#bd').value;
+        S.bills.push({ id: uid(), name, category: $('#bc').value, amount, dueDay: due ? parseD(due).getDate() : null }); save();
         const cat = $('#bc').value; render(); $('#bc').value = cat; $('#bn').focus();
       };
       $('#addBill').onclick = add;
+      app.querySelectorAll('[data-due]').forEach((sel) => (sel.onchange = () => {
+        const b = S.bills.find((x) => x.id === sel.dataset.due); if (b) { b.dueDay = sel.value ? +sel.value : null; save(); }
+      }));
       ['#bn', '#ba'].forEach((s) => onEnter($(s), add));
       app.querySelectorAll('[data-del-bill]').forEach((b) => (b.onclick = () => { S.bills = S.bills.filter((x) => x.id !== b.dataset.delBill); save(); render(); }));
       $('#next').onclick = () => (editing ? finishEdit() : go('assets'));
@@ -463,12 +605,182 @@
   function finishEdit() { editing = false; view = 'home'; render(); }
 
   /* ----- home hub ----- */
-  function summaryCol(d) {
-    const key = mkey(d), inc = S.income, exp = monthExpenses(key), tot = inc - exp;
-    return `<div><div class="mo">${monthName(d)}</div><div class="sumrow">${donut(inc, exp)}
-      <div class="kv"><div><span>Income:</span><span class="pos">${fmt(inc)}</span></div>
-      <div><span>Expenses:</span><span class="neg">${fmt(-exp)}</span></div>
-      <div><span>Total:</span><span class="${cls(tot)}">${fmt(tot)}</span></div></div></div></div>`;
+  function summaryCard() {
+    const P = planVsActual(), t0 = today0();
+    const mon = t0.toLocaleString('en-US', { month: 'short' });
+    const verdict = !S.budget
+      ? 'Add an everyday-spending budget (menu → Income, payday &amp; balance) to compare your logged spending against a plan.'
+      : Math.abs(P.diff) < 0.005 ? 'Right on plan so far.'
+      : P.diff > 0 ? `⚠️ <b>${fmt(P.diff)} over</b> plan so far this month.` : `✅ <b>${fmt(-P.diff)} under</b> plan so far this month.`;
+    return `<div class="cols">
+      <div><div class="mo">Actually spent</div><div class="sum-num neg">${fmt(P.actual)}</div>
+        <div class="kv"><div><span>Bills paid</span><span>${fmt(P.billsDue)}</span></div>
+        <div><span>Spending you logged</span><span>${fmt(P.logged)}</span></div></div></div>
+      <div><div class="mo">Planned by ${mon} ${P.day}</div><div class="sum-num">${fmt(P.planned)}</div>
+        <div class="kv"><div><span>Bills due</span><span>${fmt(P.billsDue)}</span></div>
+        <div><span>Everyday budget</span><span>${fmt(P.budgetByNow)}</span></div></div></div>
+    </div><div class="note">${verdict}</div>`;
+  }
+
+  function paramsCard() {
+    const G = goalStatus();
+    if (!G) return '<div class="empty">No goal yet — tap to set one, e.g. “Save $5,000”.</div>';
+    const g = G.g, levers = [...S.levers.sac, ...S.levers.ext].filter((x) => x.on);
+    return `<div class="big">Save <b>${fmt0(g.amount)}</b>${g.date ? ` by <b>${fmtDate(parseD(g.date))}</b>` : ''}</div>
+      <div class="bar tall"><i style="width:${Math.max(2, G.pct * 100)}%;background:var(--green)"></i></div>
+      <div class="muted sm" style="text-align:center;margin-top:4px">${fmt(Math.max(0, G.saved))} saved so far (${Math.round(G.pct * 100)}%)</div>
+      ${goalVerdict(G)}
+      ${levers.length ? `<div class="chips" style="margin-top:10px">${levers.map((x) => `<span class="chip on">${esc(x.name)} +${fmt0(x.amount)}</span>`).join('')}</div>` : ''}`;
+  }
+
+  /* The answer the Parameters section exists for: when are the conditions met? */
+  function goalVerdict(G) {
+    const g = G.g, lines = [];
+    if (G.saved >= g.amount - 0.005) return '<div class="note">🎉 <b>Goal reached!</b></div>';
+    const when = (d) => (d ? `<b>${fmtDate(d)}</b>` : '<b>not within 10 years</b>');
+    if (G.lev) {
+      lines.push(`With your selected changes (+${fmt0(G.lev)}/mo) you reach it on ${when(G.boosted)}.`);
+      if (G.boosted && G.plain && ymd(G.boosted) === ymd(G.plain)) lines.push(`That’s the same day as without them (your balance jumps on paydays), but you’d have about ${fmt0(G.gain)} more by then.`);
+      else lines.push(`Without them: ${when(G.plain)}.`);
+    } else {
+      lines.push(`At your current plan you reach it on ${when(G.plain)}.`);
+    }
+    if (!G.boosted && G.monthlyNet + G.lev <= 0) lines.push(`Your plan spends ${fmt0(-(G.monthlyNet + G.lev))} more than it brings in each month, so the balance never grows.`);
+    if (g.date) {
+      if (G.onDate === undefined) lines.push('The target date is outside the range that can be projected.');
+      else if (G.short <= 0.005) lines.push(`✅ On track: about ${fmt0(G.onDate)} saved by ${fmtDate(parseD(g.date))}.`);
+      else lines.push(`⚠️ On ${fmtDate(parseD(g.date))} you’d be <b>${fmt0(G.short)} short</b> — about ${fmt0(G.needPerMonth)} more per month would close the gap.`);
+    }
+    return `<div class="note">${lines.join('<br>')}</div>`;
+  }
+
+  /* ----- calendar ----- */
+  let calMonth = null;
+  function drawCalendar() {
+    const host = $('#calCard'); if (!host) return;
+    if (!calMonth) calMonth = new Date(today0().getFullYear(), today0().getMonth(), 1);
+    const dim = dimOf(calMonth), lead = calMonth.getDay(), tk = ymd(today0());
+    const bal = balances(new Date(calMonth.getFullYear(), calMonth.getMonth(), dim), false);
+    let cells = '<i></i>'.repeat(lead);
+    for (let day = 1; day <= dim; day++) {
+      const d = new Date(calMonth.getFullYear(), calMonth.getMonth(), day), k = ymd(d);
+      const hasTx = S.tx.some((t) => t.date === k), b = bal[k];
+      cells += `<button class="cal-d${k === tk ? ' today' : ''}" data-day="${k}" aria-label="${fmtDate(d)}">
+        <span class="n">${day}</span>
+        <span class="dots">${incomeOn(d) ? '<i class="g"></i>' : ''}${billsOn(d).length ? '<i class="r"></i>' : ''}${hasTx ? '<i class="b"></i>' : ''}</span>
+        ${b !== undefined ? `<span class="bal${b < (S.lowLimit || 0) ? ' neg' : ''}">${short$(b)}</span>` : ''}</button>`;
+    }
+    host.innerHTML = `<h2>Calendar</h2>
+      <div class="cal-head"><button class="cal-nav" id="calPrev" aria-label="Previous month">‹</button><b>${monthName(calMonth)}</b><button class="cal-nav" id="calNext" aria-label="Next month">›</button></div>
+      <div class="cal-grid">${['S', 'M', 'T', 'W', 'T', 'F', 'S'].map((x) => `<span class="cal-dow">${x}</span>`).join('')}${cells}</div>
+      <div class="legend"><span><i class="g"></i>Payday</span><span><i class="r"></i>Bill due</span><span><i class="b"></i>Spending logged</span></div>
+      <div class="muted sm" style="text-align:center;margin-top:6px">The number on each day is the money you’d have at the end of it. Tap a day to see its bills or log what you spent.</div>`;
+    $('#calPrev').onclick = () => { calMonth = shiftMonth(calMonth, -1); drawCalendar(); };
+    $('#calNext').onclick = () => { calMonth = shiftMonth(calMonth, 1); drawCalendar(); };
+    host.querySelectorAll('[data-day]').forEach((el) => (el.onclick = () => openDay(el.dataset.day)));
+  }
+
+  function openDay(k) {
+    const d = parseD(k), t0 = today0(), future = d > t0;
+    const bal = balances(d, false)[k], inc = incomeOn(d), bills = billsOn(d);
+    const tx = S.tx.filter((t) => t.date === k);
+    const perDay = future && S.budget ? S.budget / dimOf(d) : 0;
+    const body = `
+      <div class="card"><h2>${future ? 'Projected balance' : 'Balance'} at end of day</h2>
+        ${bal === undefined
+          ? `<div class="empty">This day is before your starting balance was entered (${prettyDate(S.balanceDate)}), so there is no balance for it.</div>`
+          : `<div class="hero-num ${bal < (S.lowLimit || 0) ? 'neg' : 'pos'}">${fmt(bal)}</div>
+             ${perDay ? `<div class="muted sm" style="text-align:center">Includes your planned everyday budget (${fmt(perDay)} a day) for the days between now and then.</div>` : ''}`}
+      </div>
+      <div class="card"><h2>${future ? 'Scheduled' : 'What happened'}</h2>
+        ${inc ? `<div class="row"><div class="badge" style="background:#dcf5e6">💵</div><div class="grow"><div class="t">Payday</div><div class="s">Income</div></div><div class="amt pos">+${fmt(inc)}</div></div>` : ''}
+        ${bills.map((b) => `<div class="row"><div class="badge" style="background:${CATS[b.category].color}22">${CATS[b.category].icon}</div>
+          <div class="grow"><div class="t">${esc(b.name)}</div><div class="s">Bill due${b.dueDay ? '' : ' (no due date set — assumed 1st)'}</div></div><div class="amt neg">${fmt(-b.amount)}</div></div>`).join('')}
+        ${tx.map((t) => `<div class="row"><div class="badge" style="background:${CATS[t.category].color}22">${CATS[t.category].icon}</div>
+          <div class="grow"><div class="t">${esc(t.name)}</div><div class="s">${future ? 'Planned one-off' : 'Spent'} · ${CATS[t.category].label}</div></div>
+          <div class="amt neg">${fmt(-t.amount)}</div><button class="del" data-del-tx="${t.id}" aria-label="Delete">✕</button></div>`).join('')}
+        ${!inc && !bills.length && !tx.length ? '<div class="empty">Nothing on this day</div>' : ''}
+        ${tx.length ? `<div class="total"><span>${future ? 'Planned' : 'Spent'} this day</span><span class="neg">${fmt(sum(tx, (t) => t.amount))}</span></div>` : ''}
+      </div>
+      <div class="card formcard"><h2>${future ? 'Plan a one-off expense' : 'Log what you spent'}</h2>
+        <div class="form">
+          <div><label for="dn">On what?</label><input id="dn" placeholder="e.g. Lunch" autocomplete="off"></div>
+          <div><label for="dc">Category</label><select id="dc">${catOpts('dining')}</select></div>
+          <div><label for="da">How much?</label><div class="money"><span>$</span><input id="da" inputmode="decimal" placeholder="0.00" autocomplete="off"></div></div>
+          <button class="btn" id="dAdd">${future ? 'Add planned expense' : 'Add spending'}</button>
+        </div></div>`;
+    openSheet(d.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' }), body, (sh) => {
+      const add = () => {
+        const amount = num($('#da', sh).value), category = $('#dc', sh).value;
+        if (!(amount > 0)) { $('#da', sh).focus(); return toast('Enter an amount'); }
+        S.tx.push({ id: uid(), name: $('#dn', sh).value.trim() || CATS[category].label, category, amount, date: k, created: Date.now() });
+        save(); openDay(k); toast('Added');
+      };
+      $('#dAdd', sh).onclick = add;
+      ['#dn', '#da'].forEach((q) => onEnter($(q, sh), add));
+      sh.querySelectorAll('[data-del-tx]').forEach((b) => (b.onclick = () => { S.tx = S.tx.filter((x) => x.id !== b.dataset.delTx); save(); openDay(k); }));
+    });
+  }
+
+  /* ----- parameters: goal, sacrifices, extra income ----- */
+  const paramOpen = { sac: false, ext: false };
+  function openParams() {
+    const g = S.goal;
+    const leverList = (kind) => S.levers[kind].map((x) => `<label class="lever"><input type="checkbox" data-lev="${kind}:${x.id}"${x.on ? ' checked' : ''}>
+        <span class="grow">${esc(x.name)}</span><span class="muted">+$</span><input class="mini-amt" inputmode="decimal" data-amt="${kind}:${x.id}" value="${x.amount}" aria-label="Monthly amount for ${esc(x.name)}"><span class="muted sm">/mo</span></label>`).join('') +
+      `<div class="lever add"><input class="grow" data-new-name="${kind}" placeholder="Add your own…" autocomplete="off"><span class="muted">+$</span><input class="mini-amt" inputmode="decimal" data-new-amt="${kind}" placeholder="0"><button class="chip" data-new="${kind}">Add</button></div>`;
+    const body = `
+      <div class="card form"><h2 style="text-align:left">Your parameter</h2>
+        <div><label for="gt">What do you want to achieve?</label>
+          <select id="gt"><option value="save"${g && !g.date ? ' selected' : ''}>Save an amount</option><option value="date"${g && g.date ? ' selected' : ''}>Save an amount by a date</option></select></div>
+        <div><label for="ga">How much?</label><div class="money"><span>$</span><input id="ga" inputmode="decimal" placeholder="5000" value="${g ? g.amount : ''}" autocomplete="off"></div>
+          <div class="chips" style="margin-top:8px">${[1000, 2500, 5000, 10000].map((v) => `<button class="chip" data-quick="${v}">Save ${fmt0(v)}</button>`).join('')}</div></div>
+        <div id="gdWrap"><label for="gd">By what date?</label><input id="gd" type="date" value="${g && g.date ? g.date : ''}"></div>
+        <div><label for="gl">Warn me if my balance would drop below (optional)</label><div class="money"><span>$</span><input id="gl" inputmode="decimal" placeholder="0" value="${S.lowLimit || ''}" autocomplete="off"></div>
+          <div class="muted sm hint">Days under this amount show in red on the calendar.</div></div>
+        <button class="btn" id="gSave">${g ? 'Update' : 'Set goal'}</button>
+        ${g ? '<button class="btn ghost" id="gClear">Remove goal</button>' : ''}
+      </div>
+      <div id="goalResult"></div>
+      <details class="drop" data-kind="sac"${paramOpen.sac || S.levers.sac.some((x) => x.on) ? ' open' : ''}><summary>Sacrifices <span class="muted sm">(optional)</span></summary>
+        <div class="muted sm">Ways to spend less. Tick the ones you’d commit to — each adds to what you save every month.</div>${leverList('sac')}</details>
+      <details class="drop" data-kind="ext"${paramOpen.ext || S.levers.ext.some((x) => x.on) ? ' open' : ''}><summary>Extra income <span class="muted sm">(optional)</span></summary>
+        <div class="muted sm">Things that could add to your monthly income.</div>${leverList('ext')}</details>`;
+    openSheet('Parameters', body, (sh) => {
+      const find = (ref) => { const [kind, id] = ref.split(':'); return S.levers[kind].find((x) => x.id === id); };
+      const result = () => {
+        const G = goalStatus();
+        $('#goalResult', sh).innerHTML = G
+          ? `<div class="card"><h2>When you’ll get there</h2><div class="bar tall"><i style="width:${Math.max(2, G.pct * 100)}%;background:var(--green)"></i></div>
+              <div class="muted sm" style="text-align:center;margin-top:4px">${fmt(Math.max(0, G.saved))} of ${fmt0(G.g.amount)} saved since ${prettyDate(G.g.created)}</div>${goalVerdict(G)}
+              <div class="muted sm" style="margin-top:8px">Worked out day by day from your paydays, each bill’s due date, your everyday budget and what you’ve actually logged.</div></div>`
+          : '<div class="card"><div class="empty">Set an amount above to see when you’ll reach it.</div></div>';
+      };
+      const gt = $('#gt', sh), showDate = () => $('#gdWrap', sh).classList.toggle('hidden', gt.value !== 'date');
+      gt.onchange = showDate; showDate(); result();
+      sh.querySelectorAll('[data-quick]').forEach((b) => (b.onclick = () => { $('#ga', sh).value = b.dataset.quick; }));
+      const saveGoal = () => {
+        const amount = num($('#ga', sh).value), byDate = gt.value === 'date', date = $('#gd', sh).value, low = num($('#gl', sh).value);
+        if (!(amount > 0)) { $('#ga', sh).focus(); return toast('Enter how much you want to save'); }
+        if (byDate && !date) { $('#gd', sh).focus(); return toast('Pick the date'); }
+        if (byDate && date <= todayStr()) { $('#gd', sh).focus(); return toast('Pick a date in the future'); }
+        S.lowLimit = low > 0 ? low : 0;
+        S.goal = { amount, date: byDate ? date : null, created: S.goal ? S.goal.created : todayStr(), base: S.goal ? S.goal.base : currentBalance() };
+        save(); openParams(); toast('Goal saved');
+      };
+      $('#gSave', sh).onclick = saveGoal;
+      ['#ga', '#gl'].forEach((q) => onEnter($(q, sh), saveGoal));
+      const clear = $('#gClear', sh); if (clear) clear.onclick = () => { S.goal = null; save(); openParams(); };
+      sh.querySelectorAll('details.drop').forEach((el) => el.addEventListener('toggle', () => { paramOpen[el.dataset.kind] = el.open; }));
+      sh.querySelectorAll('[data-lev]').forEach((c) => (c.onchange = () => { find(c.dataset.lev).on = c.checked; save(); result(); }));
+      sh.querySelectorAll('[data-amt]').forEach((i) => (i.oninput = () => { const v = num(i.value); find(i.dataset.amt).amount = v > 0 ? v : 0; save(); result(); }));
+      sh.querySelectorAll('[data-new]').forEach((b) => (b.onclick = () => {
+        const kind = b.dataset.new, name = $(`[data-new-name="${kind}"]`, sh).value.trim(), amount = num($(`[data-new-amt="${kind}"]`, sh).value);
+        if (!name) return toast('Give it a name');
+        if (!(amount > 0)) return toast('Enter a monthly amount');
+        S.levers[kind].push({ id: uid(), name, amount, on: true }); paramOpen[kind] = true; save(); openParams();
+      }));
+    });
   }
 
   function renderHome() {
@@ -485,8 +797,8 @@
         <button class="icon-btn" id="refresh" aria-label="Refresh">${ICONS.sync}</button>
       </header>
       <div class="wrap">
-        <section class="card tap" data-open="summary"><h2>Summary</h2>
-          <div class="cols">${summaryCol(now)}${summaryCol(shiftMonth(now, -1))}</div></section>
+        <section class="card tap full" data-open="summary"><h2>Summary — ${monthName(now)} so far</h2>
+          ${summaryCard()}</section>
 
         <section class="card tap" data-open="endmonth"><h2>End of month</h2>
           <div class="muted sm" style="text-align:center">You should have about</div>
@@ -508,12 +820,11 @@
 
         <section class="card tap" data-open="week"><h2>Spending - Last 7 days</h2>${barChart7()}</section>
 
-        <section class="card tap" data-open="networth"><h2>Net worth</h2>
-          <div class="big">Net worth: <b class="${cls(netWorth())}">${fmt(netWorth())}</b><br>
-          Debts: <b class="${debtsTotal() ? 'neg' : 'pos'}">${debtsTotal() ? '-' : ''}${fmt(debtsTotal())}</b></div>
-          ${projectionChart()}<div class="muted sm" style="text-align:center;margin-top:8px">Projected next 6 months at your current savings pace</div></section>
+        <section class="card tap wide" data-open="params"><h2>Parameters</h2>${paramsCard()}</section>
 
-        <section class="card tap" data-open="tx"><h2>Transactions</h2>
+        <section class="card full" id="calCard"></section>
+
+        <section class="card tap full" data-open="tx"><h2>Transactions</h2>
           ${recent.length ? recent.map(txRow).join('') : '<div class="empty">No transactions yet — tap + to log spending</div>'}</section>
       </div>
       <button class="fab" id="fab" aria-label="Add transaction">+</button>`;
@@ -522,6 +833,7 @@
     $('#refresh').onclick = async () => { await pull(); render(); toast('Updated'); };
     $('#fab').onclick = openTxForm;
     app.querySelectorAll('[data-open]').forEach((el) => (el.onclick = () => openDetail(el.dataset.open)));
+    drawCalendar();
   }
 
   function pill(c) {
@@ -543,9 +855,10 @@
     $('#drawer').innerHTML = `
       <div class="head"><b>Money Tracker</b><span>${esc(user ? user.email : '')}</span><br><span id="syncTag">${SYNC_LABEL[syncState]}</span></div>
       <button class="item" data-go="home">🏠 Home</button><hr>
-      <button class="item" data-go="income">💵 Monthly income</button>
+      <button class="item" data-go="income">💵 Income, payday &amp; balance</button>
       <button class="item" data-go="bills">🧾 Add / edit monthly bills</button>
       <button class="item" data-go="assets">🏡 Add property &amp; assets</button>
+      <button class="item" data-go="params">🎯 Parameters &amp; goal</button>
       <button class="item" data-go="tx">➕ Log a transaction</button>
       <button class="item" data-go="alltx">📜 All transactions</button><hr>
       <button class="item" data-go="reset">🗑️ Reset all data</button>
@@ -556,6 +869,7 @@
       const g = b.dataset.go; closeDrawer();
       if (g === 'home') return;
       if (g === 'tx') return openTxForm();
+      if (g === 'params') return openParams();
       if (g === 'alltx') return openDetail('tx');
       if (g === 'reset') return confirmReset();
       if (g === 'signout') return signOut();
@@ -575,10 +889,11 @@
     $('#sx').onclick = closeSheet;
     if (onBind) onBind(sh);
   }
-  function closeSheet() { $('#sheet').classList.add('hidden'); render(); }
+  function closeSheet() { const y = window.scrollY; $('#sheet').classList.add('hidden'); render(); window.scrollTo(0, y); }
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape') { if (!$('#sheet').classList.contains('hidden')) closeSheet(); else closeDrawer(); } });
 
   function openDetail(which) {
+    if (which === 'params') return openParams();
     const I = insights();
     if (which === 'summary' || which === 'top') {
       const over = I.cats.filter((c) => c.status === 'over');
@@ -619,7 +934,7 @@
           <div class="row"><div class="grow">Spent this month (non-bill)</div><div class="amt neg">${fmt(-I.spent)}</div></div>
           <div class="row"><div class="grow">Available to spend</div><div class="amt ${cls(I.leftNow)}">${fmt(I.leftNow)}</div></div>
           <div class="row"><div class="grow"><div>Safe daily spending</div><div class="s">${I.daysLeft} days left in the month</div></div><div class="amt">${fmt(I.perDay)}</div></div>
-          <div class="note">${I.usedHistory ? 'The projection uses your average spending from previous months.' : 'The projection assumes you keep spending at your current daily pace. It gets smarter after your first full month.'}
+          <div class="note">${I.usedBudget ? 'The projection uses your everyday-spending budget for the rest of the month.' : I.usedHistory ? 'The projection uses your average spending from previous months.' : 'The projection assumes you keep spending at your current daily pace. It gets smarter after your first full month.'}
           ${I.endBalance < 0 ? ' <b>You are on track to spend more than you earn this month.</b>' : ''}</div></div>`;
       return openSheet('End of month', body);
     }
@@ -673,7 +988,7 @@
         const name = $('#tn', sh).value.trim() || CATS[$('#tc', sh).value].label, amount = num($('#ta', sh).value), date = $('#td', sh).value;
         if (!(amount > 0)) { $('#ta', sh).focus(); return toast('Enter an amount'); }
         if (!date) return toast('Pick a date');
-        S.tx.push({ id: uid(), name, category: $('#tc', sh).value, amount, date }); save();
+        S.tx.push({ id: uid(), name, category: $('#tc', sh).value, amount, date, created: Date.now() }); save();
         closeSheet(); toast('Saved');
       };
       $('#saveTx', sh).onclick = saveTx;
@@ -697,7 +1012,12 @@
     S.bills = [
       ['Apartment rent', 'rent', 1450], ['Groceries budget', 'groceries', 520], ['Gas', 'gas', 160], ['Electric & water', 'utilities', 140],
       ['Car insurance', 'insurance', 118], ['Phone + internet', 'phone', 125], ['Streaming', 'subs', 32], ['Credit card payment', 'debt', 250],
-    ].map(([name, category, amount]) => ({ id: uid(), name, category, amount }));
+    ].map(([name, category, amount], i) => ({ id: uid(), name, category, amount, dueDay: [1, 5, 12, 18, 20, 22, 25, 28][i] }));
+    S.pay = { freq: 'semi', day1: 1, day2: 15, anchor: null };
+    S.startBalance = 3200; S.balanceDate = todayStr(); S.balanceSetAt = 1;
+    S.budget = 900;
+    S.goal = { amount: 5000, date: null, created: todayStr(), base: 3200 };
+    S.levers.sac[0].on = true;
     S.assets = [
       ['Family home', 'property', 310000], ['Honda Accord', 'vehicle', 14500], ['Savings account', 'cash', 12800],
       ['401(k)', 'retire', 41200], ['Mortgage', 'mortgage', 224000], ['Visa card', 'card', 1800],

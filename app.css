@@ -155,7 +155,6 @@ input:focus, select:focus { outline: none; border-color: var(--accent); box-shad
   .topbar { border-radius: 0 0 22px 22px; padding-left: 28px; padding-right: 28px; }
   .topbar h1 { font-size: 24px; }
   .wrap { padding: 24px 28px 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 22px; align-items: start; }
-  .wrap > section:nth-child(1), .wrap > section:nth-child(6), .wrap > section:nth-child(7) { grid-column: 1 / -1; }
   .card { padding: 18px 22px 22px; }
   .setup { max-width: 620px; margin: 0 auto; padding-top: 32px; }
   .sheet { max-width: 760px; inset: 24px 0; margin: 0 auto; border-radius: 24px; overflow: hidden; box-shadow: 0 20px 60px rgba(0,0,0,.35); }
@@ -163,8 +162,6 @@ input:focus, select:focus { outline: none; border-color: var(--accent); box-shad
 }
 @media (min-width: 1200px) {
   .wrap { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-  .wrap > section:nth-child(1), .wrap > section:nth-child(7) { grid-column: 1 / -1; }
-  .wrap > section:nth-child(6) { grid-column: span 2; }
 }
 @media (min-width: 820px) {
   .chart { max-height: 250px; }
@@ -172,3 +169,49 @@ input:focus, select:focus { outline: none; border-color: var(--accent); box-shad
   .sumrow svg { align-self: auto; width: 64px; height: 64px; }
   .kv { min-width: 220px; font-size: 15px; }
 }
+
+/* ---------- v5: summary, calendar, parameters ---------- */
+.sum-num { font-size: 24px; font-weight: 700; margin: 2px 0 4px; }
+.hint { margin-top: 4px; line-height: 1.35; }
+.inline-due { width: auto; padding: 1px 4px; font-size: 13px; border-radius: 8px; border-width: 1px; }
+.bar.tall { height: 12px; margin-top: 10px; }
+
+.cal-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+.cal-head b { font-size: 18px; }
+.cal-nav { width: 38px; height: 38px; border-radius: 50%; border: 0; background: #eaf0f1; font-size: 22px; line-height: 1; }
+.cal-grid { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 4px; }
+.cal-dow { text-align: center; font-size: 11px; color: var(--muted); font-weight: 700; padding: 2px 0; }
+.cal-d { border: 0; background: #f2f6f7; border-radius: 10px; min-height: 56px; padding: 5px 1px 4px; display: flex; flex-direction: column; align-items: center; gap: 2px; font-size: 13px; overflow: hidden; }
+.cal-d:active { background: #dfe9eb; }
+.cal-d.today { box-shadow: inset 0 0 0 2px var(--accent); background: #e2f6f3; }
+.cal-d .n { font-weight: 600; }
+.cal-d .dots { display: flex; gap: 2px; height: 6px; }
+.cal-d .dots i, .legend i { width: 6px; height: 6px; border-radius: 50%; display: inline-block; }
+i.g { background: #12a150; } i.r { background: #e5392d; } i.b { background: #2196f3; }
+.cal-d .bal { font-size: 10px; color: #37424b; white-space: nowrap; }
+.cal-d .bal.neg { color: var(--red); font-weight: 700; }
+.legend { display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; font-size: 12px; color: var(--muted); margin-top: 10px; }
+.legend i { width: 8px; height: 8px; margin-right: 5px; }
+
+.chips { display: flex; gap: 8px; flex-wrap: wrap; }
+.chip { border: 1.5px solid #d6dbde; background: #fff; border-radius: 99px; padding: 6px 12px; font-size: 14px; }
+.chip.on { border-color: #b7e3c8; background: #e9f8ef; color: #0d7a3b; }
+details.drop { background: var(--card); border-radius: 20px; padding: 2px 16px 12px; box-shadow: 0 2px 8px rgba(0,0,0,.08); }
+details.drop summary { padding: 14px 0 10px; font-weight: 700; font-size: 18px; cursor: pointer; }
+.lever { display: flex; align-items: center; gap: 8px; padding: 9px 0; border-top: 1px solid var(--line); margin: 0; font-size: 16px; font-weight: 400; color: var(--ink); }
+.lever:first-of-type { margin-top: 8px; }
+.lever input[type=checkbox] { width: 22px; height: 22px; flex: none; padding: 0; accent-color: var(--accent); }
+.lever .grow { flex: 1; min-width: 0; }
+.lever .mini-amt { width: 72px; padding: 6px 8px; font-size: 15px; text-align: right; flex: none; }
+.lever.add input.grow { padding: 6px 10px; font-size: 15px; }
+
+@media (min-width: 820px) {
+  .wrap > .full, .wrap > .wide { grid-column: 1 / -1; }
+  .cal-d { min-height: 72px; font-size: 15px; }
+  .cal-d .bal { font-size: 12px; }
+}
+@media (min-width: 1200px) {
+  .wrap > .wide { grid-column: span 2; }
+}
+
+@media (min-width: 820px) { .kv { min-width: 0; } }
