@@ -44,7 +44,8 @@
   const todayStr = () => { const n = new Date(); return `${n.getFullYear()}-${String(n.getMonth() + 1).padStart(2, '0')}-${String(n.getDate()).padStart(2, '0')}`; };
   const blank = () => ({
     onboarded: false, income: 0, bills: [], assets: [], tx: [],
-    pay: { freq: 'monthly', day1: 1, day2: 15, anchor: null },   // when income arrives
+    pay: { freq: 'semi', day1: 1, day2: 15, anchor: null },      // when income arrives: half on the 1st, half on the 15th
+    payV: 2,
     startBalance: 0, balanceDate: todayStr(), balanceSetAt: 0,     // cash on hand, and when it was entered
     budget: 0,                                                     // planned everyday (non-bill) spending per month
     lowLimit: 0,                                                   // warn when the projected balance drops below this
@@ -94,6 +95,7 @@
     } else if (data) {
       S = Object.assign(blank(), data.data); lastSeen = data.updated_at; setSync('saved');
       if (!data.data.balanceDate) save(); // older data: pin the starting-balance date so it doesn't drift
+      if (data.data.payV !== 2) { S.pay = { freq: 'semi', day1: 1, day2: 15, anchor: null }; S.payV = 2; save(); } // one-time move to 1st + 15th paydays
     } else { // brand-new account: adopt data already on this device (from before accounts existed)
       const local = readLocal(cacheKey()) || readLocal(KEY);
       S = local || blank();
@@ -450,9 +452,9 @@
   }
 
   function incomeStep() {
-    const p = S.pay || {}, f = p.freq || 'monthly';
+    const p = S.pay || {}, f = p.freq || 'semi';
     const dayOpts = (sel) => Array.from({ length: 31 }, (_, i) => `<option value="${i + 1}"${i + 1 === sel ? ' selected' : ''}>${ord(i + 1)}</option>`).join('');
-    const freqs = [['monthly', 'Once a month'], ['semi', 'Twice a month'], ['biweekly', 'Every two weeks'], ['weekly', 'Every week']];
+    const freqs = [['semi', 'Twice a month (income split in half)'], ['monthly', 'Once a month'], ['biweekly', 'Every two weeks'], ['weekly', 'Every week']];
     return `
       <div class="lead"><h2>${editing ? 'Income, payday &amp; balance' : 'Let’s set up your money'}</h2>
         <p>${editing ? 'These numbers drive the calendar and your goal date.' : 'First, your household income and when it arrives.'}</p></div>
@@ -475,7 +477,7 @@
       </div>
       <button class="btn" id="next">${editing ? 'Save' : 'Next'}</button>
       ${editing ? '' : '<button class="link" id="demo">or try it with sample data</button>'}
-      <p class="muted sm" style="text-align:center;margin:0">version 5</p>`;
+      <p class="muted sm" style="text-align:center;margin:0">version 6</p>`;
   }
 
   function billsStep() {
@@ -708,7 +710,11 @@
           <div><label for="dc">Category</label><select id="dc">${catOpts('dining')}</select></div>
           <div><label for="da">How much?</label><div class="money"><span>$</span><input id="da" inputmode="decimal" placeholder="0.00" autocomplete="off"></div></div>
           <button class="btn" id="dAdd">${future ? 'Add planned expense' : 'Add spending'}</button>
-        </div></div>`;
+        </div></div>
+      <div class="card"><h2>Add from a picture</h2>
+        <div class="muted sm" style="text-align:center;margin-bottom:10px">Take or choose a photo of a receipt, or a screenshot of your bank transactions. AI reads who was paid, how much and when, and you confirm before anything is added.</div>
+        <input type="file" id="dPic" accept="image/*" class="hidden">
+        <button class="btn ghost pic" id="dPicBtn">📷 Add a picture</button></div>`;
     openSheet(d.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' }), body, (sh) => {
       const add = () => {
         const amount = num($('#da', sh).value), category = $('#dc', sh).value;
@@ -717,8 +723,98 @@
         save(); openDay(k); toast('Added');
       };
       $('#dAdd', sh).onclick = add;
+      $('#dPicBtn', sh).onclick = () => $('#dPic', sh).click();
+      $('#dPic', sh).onchange = (e) => { const f = e.target.files[0]; if (f) scanPicture(f, k); };
       ['#dn', '#da'].forEach((q) => onEnter($(q, sh), add));
       sh.querySelectorAll('[data-del-tx]').forEach((b) => (b.onclick = () => { S.tx = S.tx.filter((x) => x.id !== b.dataset.delTx); save(); openDay(k); }));
+    });
+  }
+
+  /* ----- read transactions from a picture (AI, through the read-transactions server function) ----- */
+  function shrinkImage(file, maxEdge = 2576) {
+    return new Promise((resolve, reject) => {
+      const url = URL.createObjectURL(file), img = new Image();
+      img.onload = () => {
+        const scale = Math.min(1, maxEdge / Math.max(img.naturalWidth, img.naturalHeight));
+        const c = document.createElement('canvas');
+        c.width = Math.round(img.naturalWidth * scale); c.height = Math.round(img.naturalHeight * scale);
+        const ctx = c.getContext('2d');
+        ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height); ctx.drawImage(img, 0, 0, c.width, c.height);
+        URL.revokeObjectURL(url);
+        resolve(c.toDataURL('image/jpeg', 0.88).split(',')[1]);
+      };
+      img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('not an image')); };
+      img.src = url;
+    });
+  }
+  const SCAN_ERRORS = {
+    not_configured: 'The picture reader isn’t switched on yet: it needs an Anthropic API key added to the Supabase project (Edge Functions → Secrets → ANTHROPIC_API_KEY).',
+    bad_key: 'The Anthropic API key saved in Supabase was rejected. Check that it is correct and has credit.',
+    daily_limit: 'You’ve reached today’s limit for reading pictures. Try again tomorrow, or type the expenses in.',
+    busy: 'The AI service is busy right now. Wait a minute and try again.',
+    image_too_large: 'That picture is too large to send. Try a tighter crop.',
+    declined: 'The AI declined to read that picture.',
+    too_many: 'There were too many transactions in that picture to read at once. Try a picture with fewer rows.',
+    unreadable: 'The AI’s answer couldn’t be understood. Try again, or use a clearer picture.',
+    not_signed_in: 'Your sign-in has expired. Sign out and back in, then try again.',
+  };
+  let scanRun = 0;
+  async function scanPicture(file, k) {
+    const run = ++scanRun;
+    openSheet('Reading your picture…', '<div class="card"><div class="empty">🔎 Looking for payments in your picture.<br>This can take up to a minute — keep this open.</div></div>');
+    $('#sx').onclick = () => { scanRun++; openDay(k); };
+    const fail = (msg) => { if (run === scanRun) openSheet('Couldn’t read the picture', `<div class="card"><p>${esc(msg)}</p></div><button class="btn" id="scBack">Back to the day</button>`, (sh) => { $('#scBack', sh).onclick = () => openDay(k); $('#sx').onclick = () => openDay(k); }); };
+    let image;
+    try { image = await shrinkImage(file); } catch (e) { return fail('That file couldn’t be opened as a picture.'); }
+    let res;
+    try { res = await sb.functions.invoke('read-transactions', { body: { image, media_type: 'image/jpeg', day: k, today: todayStr() } }); }
+    catch (e) { return fail('Couldn’t reach the picture reader. Check your connection and try again.'); }
+    if (res.error) {
+      let code = '';
+      try { code = (await res.error.context.json()).error; } catch (e) { /* no JSON body */ }
+      return fail(SCAN_ERRORS[code] || 'Something went wrong reading the picture. Please try again.');
+    }
+    if (run !== scanRun) return; // cancelled while waiting
+    reviewScan(k, (res.data && res.data.transactions) || []);
+  }
+
+  /* Nothing is added until the person confirms: every row can be unticked or corrected first. */
+  function reviewScan(k, found) {
+    const back = (sh) => { $('#sx').onclick = () => openDay(k); const b = $('#scBack', sh); if (b) b.onclick = () => openDay(k); };
+    if (!found.length) {
+      return openSheet('Nothing found', '<div class="card"><div class="empty">No payments could be read from that picture. Try a clearer or closer photo.</div></div><button class="btn" id="scBack">Back to the day</button>', back);
+    }
+    const exists = (t) => S.tx.some((x) => x.date === t.date && Math.abs(x.amount - t.amount) < 0.005 && x.name.toLowerCase() === t.merchant.toLowerCase());
+    const items = found.map((t) => { const it = { merchant: t.merchant, amount: t.amount, date: t.date || k, category: CATS[t.category] ? t.category : 'other', dated: !!t.date }; it.dup = exists(it); return it; });
+    const body = `
+      <div class="card"><h2>Found ${items.length} payment${items.length > 1 ? 's' : ''}</h2>
+        <div class="muted sm" style="text-align:center">Check each one, fix anything the AI misread, then add them. Payments go on the date shown.</div>
+        ${items.map((t, i) => `<div class="scan" data-i="${i}">
+          <label class="scan-top"><input type="checkbox" data-f="on"${t.dup ? '' : ' checked'}><input data-f="merchant" value="${esc(t.merchant)}" aria-label="Paid to" autocomplete="off"></label>
+          <div class="scan-row"><div class="money"><span>$</span><input data-f="amount" inputmode="decimal" value="${t.amount.toFixed(2)}" aria-label="Amount"></div>
+            <input data-f="date" type="date" value="${t.date}" aria-label="Date"></div>
+          <select data-f="category" aria-label="Category">${catOpts(t.category)}</select>
+          ${t.dup ? '<div class="muted sm">Already on your calendar — left unticked.</div>' : t.dated ? '' : '<div class="muted sm">No date in the picture — using the day you opened.</div>'}
+        </div>`).join('')}</div>
+      <button class="btn" id="scAdd">Add to calendar</button><button class="btn ghost" id="scBack">Cancel</button>`;
+    openSheet('Check what was found', body, (sh) => {
+      back(sh);
+      $('#scAdd', sh).onclick = () => {
+        const add = [];
+        for (const row of sh.querySelectorAll('.scan')) {
+          const f = (n) => $(`[data-f="${n}"]`, row);
+          if (!f('on').checked) continue;
+          const amount = num(f('amount').value), date = f('date').value, category = f('category').value;
+          if (!(amount > 0)) { f('amount').focus(); return toast('Fix the amount, or untick that row'); }
+          if (!date) { f('date').focus(); return toast('Pick a date, or untick that row'); }
+          add.push({ id: uid(), name: f('merchant').value.trim() || CATS[category].label, category, amount, date, created: Date.now() });
+        }
+        if (!add.length) return toast('Nothing ticked');
+        S.tx.push(...add); save();
+        const other = add.filter((t) => t.date !== k).length;
+        openDay(k);
+        toast(`Added ${add.length} expense${add.length > 1 ? 's' : ''}${other ? ` (${other} on other days)` : ''}`);
+      };
     });
   }
 

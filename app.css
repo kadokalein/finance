@@ -215,3 +215,14 @@ details.drop summary { padding: 14px 0 10px; font-weight: 700; font-size: 18px; 
 }
 
 @media (min-width: 820px) { .kv { min-width: 0; } }
+
+/* ---------- v6: picture reader ---------- */
+.btn.pic { border: 1.5px dashed #9fc9cf; }
+.scan { padding: 12px 0; border-top: 1px solid var(--line); display: flex; flex-direction: column; gap: 8px; }
+.scan:first-of-type { margin-top: 10px; }
+.scan-top { display: flex; align-items: center; gap: 10px; margin: 0; }
+.scan-top input[type=checkbox] { width: 24px; height: 24px; flex: none; padding: 0; accent-color: var(--accent); }
+.scan-top input:not([type=checkbox]) { font-weight: 600; }
+.scan-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr); gap: 8px; }
+.scan input, .scan select { padding: 9px 12px; font-size: 16px; }
+.scan .money input { padding-left: 26px; }
